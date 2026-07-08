@@ -24,6 +24,10 @@ Thumbs.db
 # Project runtime output directory
 results/
 
+# Generated output files
+*.csv
+*.png
+
 # Jupyter
 .ipynb_checkpoints/
 
