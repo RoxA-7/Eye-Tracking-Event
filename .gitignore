@@ -1,21 +1,34 @@
-﻿# Virtual environment
-venv/
-
-# Python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
 
 # IDE
 .vscode/
 .idea/
-
-# Results (sample data kept, but generated results excluded)
-results/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
 
+# Project runtime output directory
+results/
+
 # Jupyter
 .ipynb_checkpoints/
+
+# Environment
+.env
+
+# Reasonix metadata
+.reasonix/
