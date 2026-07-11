@@ -22,18 +22,43 @@ def load_trial_logs(input_glob):
 
 
 def summarize_trials(df):
-    group_cols = ["condition", "input_method", "target_radius"]
+    df = df.copy()
+    group_cols = [
+        "condition",
+        "input_method",
+        "calibration_mode",
+        "gaze_smoothing_window",
+        "dwell_method",
+        "target_radius",
+    ]
+    for column in ("success", "missed_selection"):
+        if column in df:
+            df[column] = df[column].map(
+                lambda value: value
+                if isinstance(value, bool)
+                else str(value).strip().lower() in {"true", "1", "yes"}
+            )
+
+    aggregations = {
+        "trials": ("trial_id", "count"),
+        "success_rate": ("success", "mean"),
+        "mean_selection_time_sec": ("selection_time_sec", "mean"),
+        "median_selection_time_sec": ("selection_time_sec", "median"),
+        "false_clicks_mean": ("false_click_count", "mean"),
+        "missed_rate": ("missed_selection", "mean"),
+        "mean_distance_px": ("distance_to_target_px", "mean"),
+    }
+    optional_metrics = {
+        "mean_confidence": ("mean_confidence", "mean"),
+        "mean_tracking_lost_ratio": ("tracking_lost_ratio", "mean"),
+        "mean_fps": ("fps_mean", "mean"),
+    }
+    aggregations.update(
+        {name: spec for name, spec in optional_metrics.items() if spec[0] in df.columns}
+    )
     summary = (
         df.groupby(group_cols, dropna=False)
-        .agg(
-            trials=("trial_id", "count"),
-            success_rate=("success", "mean"),
-            mean_selection_time_sec=("selection_time_sec", "mean"),
-            median_selection_time_sec=("selection_time_sec", "median"),
-            false_clicks_mean=("false_click_count", "mean"),
-            missed_rate=("missed_selection", "mean"),
-            mean_distance_px=("distance_to_target_px", "mean"),
-        )
+        .agg(**aggregations)
         .reset_index()
     )
     return summary.round(3)

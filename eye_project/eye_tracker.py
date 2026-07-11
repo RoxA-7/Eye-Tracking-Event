@@ -397,6 +397,9 @@ class EyeTracker:
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
+                    if not isinstance(self.video_source, int):
+                        print("Video source ended.")
+                        break
                     continue
 
                 self.process_frame(frame)
@@ -471,6 +474,7 @@ class CalibratedEyeTracker(EyeTracker):
         self,
         auto_click_duration=3.0,
         calibration_points=5,
+        calibration_samples_per_point=12,
         click_cooldown=1.0,
         min_click_confidence=0.6,
         **kwargs,
@@ -479,6 +483,7 @@ class CalibratedEyeTracker(EyeTracker):
         self.gaze_model = None
         self.auto_click_duration = auto_click_duration
         self.calibration_points = calibration_points
+        self.calibration_samples_per_point = max(3, calibration_samples_per_point)
         self.click_cooldown = click_cooldown
         self.min_click_confidence = min_click_confidence
         self.screen_w = None
@@ -507,7 +512,7 @@ class CalibratedEyeTracker(EyeTracker):
         raise ValueError("calibration_points must be one of: 5, 9, 13")
 
     def run_calibration(self):
-        """Collect calibration samples and train gaze-to-screen mapping."""
+        """Collect multi-frame samples on a full-screen calibration canvas."""
         import pyautogui
         from sklearn.linear_model import LinearRegression
 
@@ -515,36 +520,48 @@ class CalibratedEyeTracker(EyeTracker):
         print(f"Calibration started: {len(calib_points)} points.")
         calib_data = []
         started = time.time()
+        self.screen_w, self.screen_h = pyautogui.size()
 
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            print("Unable to open webcam for calibration.")
+            print(f"Unable to open video source for calibration: {self.video_source}")
             return False
 
+        window_name = "Calibration"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         idx = 0
+        point_started = time.monotonic()
+        point_samples = []
         while idx < len(calib_points):
             ret, frame = cap.read()
             if not ret:
+                if not isinstance(self.video_source, int):
+                    print("Video source ended during calibration.")
+                    break
                 continue
 
-            h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = self.face_mesh.process(rgb)
 
             norm_pt = calib_points[idx]
-            px, py = int(norm_pt[0] * w), int(norm_pt[1] * h)
-            cv2.circle(frame, (px, py), 15, (0, 255, 255), -1)
+            px = int(norm_pt[0] * (self.screen_w - 1))
+            py = int(norm_pt[1] * (self.screen_h - 1))
+            canvas = np.full((self.screen_h, self.screen_w, 3), 245, dtype=np.uint8)
+            cv2.circle(canvas, (px, py), 18, (0, 170, 230), -1)
+            cv2.circle(canvas, (px, py), 4, (20, 20, 20), -1)
             cv2.putText(
-                frame,
-                f"Point {idx + 1}/{len(calib_points)}",
-                (max(px - 60, 0), max(py - 25, 20)),
+                canvas,
+                f"Point {idx + 1}/{len(calib_points)} - keep looking at the center",
+                (24, 42),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (0, 255, 255),
+                (30, 30, 30),
                 2,
             )
 
-            if res.multi_face_landmarks:
+            settling = time.monotonic() - point_started < 0.6
+            if res.multi_face_landmarks and not settling:
                 lm = res.multi_face_landmarks[0].landmark
                 roi_l, off_l = self.extract_eye_roi(frame, lm, self.LEFT_EYE)
                 roi_r, off_r = self.extract_eye_roi(frame, lm, self.RIGHT_EYE)
@@ -554,12 +571,39 @@ class CalibratedEyeTracker(EyeTracker):
                 if pl and pr:
                     gx = (pl[0] + pr[0]) // 2
                     gy = (pl[1] + pr[1]) // 2
-                    calib_data.append([idx + 1, gx, gy, norm_pt[0], norm_pt[1]])
-                    print(f"  collected point {idx + 1}/{len(calib_points)} -> gaze=({gx},{gy})")
-                    idx += 1
-                    time.sleep(0.8)
+                    point_samples.append((gx, gy))
 
-            cv2.imshow("Calibration", frame)
+            sample_count = len(point_samples)
+            cv2.putText(
+                canvas,
+                f"Samples: {sample_count}/{self.calibration_samples_per_point}",
+                (24, 76),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (30, 30, 30),
+                2,
+            )
+            if sample_count >= self.calibration_samples_per_point:
+                samples = np.asarray(point_samples, dtype=float)
+                gx, gy = np.median(samples, axis=0)
+                calib_data.append(
+                    [
+                        idx + 1,
+                        float(gx),
+                        float(gy),
+                        norm_pt[0],
+                        norm_pt[1],
+                        sample_count,
+                        round(float(np.std(samples[:, 0])), 3),
+                        round(float(np.std(samples[:, 1])), 3),
+                    ]
+                )
+                print(f"  collected point {idx + 1}/{len(calib_points)} -> gaze=({gx:.1f},{gy:.1f})")
+                idx += 1
+                point_samples = []
+                point_started = time.monotonic()
+
+            cv2.imshow(window_name, canvas)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
@@ -570,9 +614,11 @@ class CalibratedEyeTracker(EyeTracker):
             print("Insufficient calibration data.")
             return False
 
-        df = pd.DataFrame(calib_data, columns=["point_index", "gx", "gy", "sx", "sy"])
+        df = pd.DataFrame(
+            calib_data,
+            columns=["point_index", "gx", "gy", "sx", "sy", "sample_count", "gaze_std_x", "gaze_std_y"],
+        )
         self.gaze_model = LinearRegression().fit(df[["gx", "gy"]], df[["sx", "sy"]])
-        self.screen_w, self.screen_h = pyautogui.size()
         self._save_calibration_report(df, time.time() - started)
         print("Calibration complete.")
         return True
@@ -668,6 +714,9 @@ class CalibratedEyeTracker(EyeTracker):
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
+                    if not isinstance(self.video_source, int):
+                        print("Video source ended.")
+                        break
                     continue
 
                 record = self.process_frame(frame)

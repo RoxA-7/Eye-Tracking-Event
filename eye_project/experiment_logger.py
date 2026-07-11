@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import csv
+import json
 import os
 import time
 
@@ -115,4 +116,14 @@ def iso_now():
 
 
 def elapsed_since(start_time):
-    return round(time.time() - start_time, 3)
+    return round(time.monotonic() - start_time, 3)
+
+
+def save_session_config(output_dir, session_id, config):
+    """Persist the exact experiment parameters used for a session."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"session_config_{session_id}.json")
+    payload = {"created_at": iso_now(), **config}
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+    return path

@@ -14,8 +14,8 @@ dependency set is validated against Python 3.12.
 - Gaze heatmap export.
 - 5-point, 9-point, and 13-point calibration modes for screen mapping.
 - Confidence-gated dwell click with click cooldown and clamped screen coordinates.
-- Mouse baseline target-selection experiment with trial-level logging.
-- Basic analysis script for trial-level experiment summaries.
+- Mouse and full-screen gaze target-selection conditions with trial-level logging.
+- Reproducible session configuration files and gaze-quality summaries.
 
 ## Project Structure
 
@@ -25,7 +25,9 @@ eye_project/
 ├── eye_tracking.py                # Webcam/video tracking entry point
 ├── eye_tracking-test.py           # Calibrated gaze mouse-control entry point
 ├── experiment_logger.py           # Stable trial-level CSV schema and logger
-├── target_selection_experiment.py # Mouse baseline target-selection experiment
+├── target_selection_experiment.py # Mouse/gaze target-selection experiment
+├── experiment_protocol.md         # Reproducible study conditions and run rules
+├── tests/                         # Hardware-independent experiment tests
 ├── analysis/
 │   └── analyze_results.py         # Summary script for trial logs
 ├── requirements.txt               # Python dependencies
@@ -100,17 +102,28 @@ The calibrated mode writes a `calibration_report_*.csv` file with per-point
 training residuals. Dwell clicks are suppressed when gaze confidence is below
 `--min-click-confidence`, and repeated clicks are limited by `--click-cooldown`.
 
-## Run Mouse Baseline Experiment
+## Run Target-Selection Experiments
 
-This provides a controlled target-selection surface before gaze conditions are
-integrated.
+Run the mouse baseline:
 
 ```powershell
-python target_selection_experiment.py --participant-id pilot01 --trials-per-radius 8
+python target_selection_experiment.py --participant-id pilot01 --session-id pilot01_mouse --input-method mouse --trials-per-radius 8 --seed 42
 ```
 
-It logs trial-level CSV files with target size, click location, success, false
-click count, timeout/miss, and selection time.
+Run a 9-point gaze condition with confidence-aware dwell:
+
+```powershell
+python target_selection_experiment.py --participant-id pilot01 --session-id pilot01_gaze9 --input-method gaze --calibration-points 9 --dwell-method confidence_aware --seed 42
+```
+
+Use `--dwell-method fixed` for the dwell ablation and
+`--calibration-points 5` for the calibration-density comparison. Gaze mode uses
+a full-screen surface so calibration, mapped gaze, and targets share screen
+coordinates. Each run saves a session configuration JSON and trial-level CSV;
+gaze runs additionally save calibration and raw tracking data.
+
+The formal condition matrix, exclusion rules, and output checks are documented
+in `eye_project/experiment_protocol.md`.
 
 ## Analyze Trial Logs
 
@@ -118,8 +131,15 @@ click count, timeout/miss, and selection time.
 python analysis\analyze_results.py --input "results/trial_log_*.csv" --output results\summary_trials.csv
 ```
 
-The script reports success rate, selection time, false clicks, miss rate, and
-distance-to-target summaries grouped by condition, input method, and target size.
+The script groups results by experiment condition, calibration, smoothing,
+dwell method, and target size. It reports success, selection time, false clicks,
+misses, distance, confidence, tracking loss, and FPS when those fields exist.
+
+## Run Hardware-Independent Tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
 
 ## Research Notes
 
