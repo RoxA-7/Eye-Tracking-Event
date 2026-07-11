@@ -1,4 +1,6 @@
 opencv-python
-mediapipe==0.10.0
+mediapipe==0.10.35
 pandas
 matplotlib
+scikit-learn
+pyautogui

@@ -1,51 +1,58 @@
 """
-Eye Tracking Engine — shared module for pupil detection and gaze analysis.
+Shared eye-tracking engine for pupil detection, gaze analysis, calibration,
+and dwell-based mouse control.
 
-Uses MediaPipe Face Mesh to locate eyes, adaptive thresholding to find pupils,
-and provides gaze smoothing, fixation detection, blink counting, heatmap generation,
-and data export.
-
-Usage:
-    from eye_tracker import EyeTracker
-    tracker = EyeTracker(video_source=0)
-    tracker.run()
+The module is intentionally lightweight: the core tracker can run from a
+webcam or video file, saves traceable CSV/PNG outputs, and exposes enough
+quality fields to support later experiment logging and paper analysis.
 """
 
-import cv2
-import numpy as np
-import time
-import mediapipe as mp
-import pandas as pd
-from datetime import datetime
+from __future__ import annotations
+
 from collections import deque
-import matplotlib.pyplot as plt
+from datetime import datetime
+import math
 import os
 import platform
 import subprocess
+import time
+
+import cv2
+import matplotlib.pyplot as plt
+import mediapipe as mp
+import numpy as np
+import pandas as pd
 
 
 class EyeTracker:
-    """Core eye tracking engine.
+    """Core eye-tracking engine.
 
     Parameters
     ----------
-    video_source : int or str
-        0 for webcam, or path to video file.
-    enable_heatmap : bool
-        Overlay a gaze heatmap on the frame.
-    enable_fixation : bool
+    video_source:
+        ``0`` for webcam, or a video file path.
+    enable_heatmap:
+        Overlay and save a gaze heatmap.
+    enable_fixation:
         Detect and record fixations.
-    enable_blink_detection : bool
-        Count blinks and trigger fatigue alerts.
-    gaze_smoothing : int
-        Number of frames to average for gaze smoothing (buffer size).
-    process_every_n_frames : int
-        Run MediaPipe only every N frames; reuse last landmarks on others.
-        Higher = faster but less responsive (1 = every frame, 2 = every 2nd).
-    flush_interval : int
-        Auto-save data to disk every N frames (0 = only at exit).
-    show_debug_windows : bool
-        Show per-eye threshold debug windows (adds latency).
+    enable_blink_detection:
+        Count blink-like pupil-loss events.
+    gaze_smoothing:
+        Number of recent gaze points used for smoothing.
+    process_every_n_frames:
+        Run MediaPipe every N frames and reuse recent landmarks between runs.
+    flush_interval:
+        Save partial CSV files every N processed frames. ``0`` disables this.
+    show_debug_windows:
+        Show per-eye threshold windows.
+    output_dir:
+        Directory for CSV/PNG outputs.
+    open_output_dir:
+        Open the output folder after cleanup. Disabled by default for
+        reproducible batch runs.
+    max_stale_landmark_frames:
+        Number of consecutive MediaPipe misses before cached landmarks are
+        discarded.
     """
 
     LEFT_EYE = [33, 133]
@@ -61,6 +68,9 @@ class EyeTracker:
         process_every_n_frames=1,
         flush_interval=300,
         show_debug_windows=False,
+        output_dir="results",
+        open_output_dir=False,
+        max_stale_landmark_frames=5,
     ):
         self.video_source = video_source
         self.enable_heatmap = enable_heatmap
@@ -69,54 +79,46 @@ class EyeTracker:
         self.process_every_n_frames = max(1, process_every_n_frames)
         self.flush_interval = flush_interval
         self.show_debug_windows = show_debug_windows
+        self.output_dir = output_dir
+        self.open_output_dir = open_output_dir
+        self.max_stale_landmark_frames = max(0, max_stale_landmark_frames)
 
-        # MediaPipe
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False, max_num_faces=1, refine_landmarks=True
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
         )
 
-        # Gaze smoothing
-        self.gaze_buffer = deque(maxlen=gaze_smoothing)
-
-        # Heatmap
+        self.gaze_buffer = deque(maxlen=max(1, gaze_smoothing))
         self.heatmap_layer = None
 
-        # Fixation state
         self.fixations = []
-        self.fixation_threshold = 15  # pixels
-        self.min_fixation_duration = 0.5  # seconds
+        self.fixation_threshold = 15
+        self.min_fixation_duration = 0.5
         self.fixation_start_time = None
         self.fixation_reference = None
-        # Jitter tolerance: allow N out-of-threshold frames before resetting fixation
         self._jitter_counter = 0
         self._jitter_tolerance = 3
 
-        # Blink / fatigue
         self.blink_count = 0
         self.fatigue_alert_triggered = False
-        # Require N consecutive pupil-loss frames to count as one blink
         self._blink_loss_frames = 0
         self._blink_loss_threshold = 3
 
-        # Recording
         self.data_records = []
         self.frame_count = 0
         self.start_time = time.time()
-
-        # Frame-skip state: reuse last landmarks on non-key frames
         self._last_landmarks = None
-
-        # Video capture
+        self._stale_landmark_frames = 0
         self.cap = None
 
-    # ── geometry helpers ──────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Geometry and detection helpers
+    # ------------------------------------------------------------------
 
     def extract_eye_roi(self, image, landmarks, eye_indices, margin=10):
-        """Crop the eye region from the frame using normalized landmarks.
-
-        Returns (roi_image, (x_offset, y_offset)).
-        """
+        """Crop the eye region from the frame using normalized landmarks."""
         h, w = image.shape[:2]
         x1 = int(landmarks[eye_indices[0]].x * w)
         y1 = int(landmarks[eye_indices[0]].y * h)
@@ -127,29 +129,14 @@ class EyeTracker:
         y_min = max(min(y1, y2) - margin, 0)
         x_max = min(max(x1, x2) + margin, w)
         y_max = min(max(y1, y2) + margin, h)
-
-        roi = image[y_min:y_max, x_min:x_max]
-        return roi, (x_min, y_min)
-
-    # ── pupil detection ───────────────────────────────────────────────
+        return image[y_min:y_max, x_min:x_max], (x_min, y_min)
 
     def detect_pupil(self, roi, draw_on=None, offset=(0, 0), label=None):
-        """Detect pupil centre in an eye ROI via adaptive thresholding.
+        """Detect pupil center in an eye ROI via adaptive thresholding.
 
-        Parameters
-        ----------
-        roi : np.ndarray
-            Eye region image (BGR).
-        draw_on : np.ndarray or None
-            Frame to draw detection overlay on (optional).
-        offset : tuple
-            (x, y) offset to convert ROI-local coords to full-frame coords.
-        label : str or None
-            If given, show the threshold debug window with this title.
-
-        Returns
-        -------
-        (cx, cy) in full-frame pixel coordinates, or None.
+        The returned coordinate is always in the same coordinate system as the
+        provided ``offset``. Pass ``offset=(0, 0)`` for ROI-local coordinates or
+        the ROI top-left offset for full-frame coordinates.
         """
         if roi.size == 0:
             return None
@@ -158,11 +145,14 @@ class EyeTracker:
         gray = cv2.GaussianBlur(gray, (7, 7), 0)
         gray = cv2.equalizeHist(gray)
 
-        # Adaptive threshold — robust to varying lighting
         thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            11,
+            2,
         )
-
         if label and self.show_debug_windows:
             cv2.imshow(label, thresh)
 
@@ -170,54 +160,52 @@ class EyeTracker:
         if not contours:
             return None
 
-        # Largest valid contour = pupil
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for cnt in contours:
+        ox, oy = offset
+        for cnt in sorted(contours, key=cv2.contourArea, reverse=True):
             if cv2.contourArea(cnt) < 100:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
             cx, cy = x + w // 2, y + h // 2
-            ox, oy = offset
 
             if draw_on is not None:
-                # Bounding box
-                cv2.rectangle(
-                    draw_on, (ox + x, oy + y), (ox + x + w, oy + y + h),
-                    (255, 0, 0), 2,
-                )
-                # Crosshair
+                cv2.rectangle(draw_on, (ox + x, oy + y), (ox + x + w, oy + y + h), (255, 0, 0), 2)
                 cv2.line(draw_on, (ox + cx, oy + y), (ox + cx, oy + y + h), (0, 255, 0), 1)
                 cv2.line(draw_on, (ox + x, oy + cy), (ox + x + w, oy + cy), (0, 255, 0), 1)
 
-            return (ox + cx, oy + cy)
-
+            return ox + cx, oy + cy
         return None
 
-    # ── gaze computation ──────────────────────────────────────────────
-
     def compute_gaze(self, left_center, right_center):
-        """Average left & right pupil centres + smooth over time.
-
-        Returns (gaze_x, gaze_y) or (None, None).
-        """
+        """Average left and right pupil centers, then smooth over time."""
         if left_center is None or right_center is None:
             return None, None
 
         raw_x = (left_center[0] + right_center[0]) // 2
         raw_y = (left_center[1] + right_center[1]) // 2
         self.gaze_buffer.append((raw_x, raw_y))
-
-        gaze_x = int(sum(p[0] for p in self.gaze_buffer) / len(self.gaze_buffer))
-        gaze_y = int(sum(p[1] for p in self.gaze_buffer) / len(self.gaze_buffer))
+        gaze_x = int(sum(point[0] for point in self.gaze_buffer) / len(self.gaze_buffer))
+        gaze_y = int(sum(point[1] for point in self.gaze_buffer) / len(self.gaze_buffer))
         return gaze_x, gaze_y
 
-    # ── heatmap ───────────────────────────────────────────────────────
+    def estimate_gaze_confidence(self, face_detected, left_center, right_center):
+        """Estimate a simple, interpretable tracking-confidence score."""
+        if not face_detected:
+            return 0.0
+        detected_eyes = int(left_center is not None) + int(right_center is not None)
+        if detected_eyes == 0:
+            return 0.0
+
+        pupil_score = detected_eyes / 2.0
+        stability_score = 1.0
+        if len(self.gaze_buffer) >= 3:
+            xs = np.array([point[0] for point in self.gaze_buffer], dtype=float)
+            ys = np.array([point[1] for point in self.gaze_buffer], dtype=float)
+            jitter = math.sqrt(float(np.var(xs) + np.var(ys)))
+            stability_score = max(0.0, min(1.0, 1.0 - jitter / 50.0))
+        return round(pupil_score * stability_score, 3)
 
     def update_heatmap(self, gaze_point, frame):
-        """Add gaze point to persistent heatmap layer and blend onto frame.
-
-        Returns the blended frame (modified in place).
-        """
+        """Add gaze point to a persistent heatmap layer and blend onto frame."""
         if not self.enable_heatmap:
             return frame
 
@@ -226,28 +214,23 @@ class EyeTracker:
             self.heatmap_layer = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.float32)
 
         cv2.circle(self.heatmap_layer, (gx, gy), 3, 1, -1)
-        # Decay: prevent unbounded saturation over long sessions
         self.heatmap_layer *= 0.995
         heatmap_vis = cv2.applyColorMap(
-            cv2.convertScaleAbs(self.heatmap_layer, alpha=10), cv2.COLORMAP_JET
+            cv2.convertScaleAbs(self.heatmap_layer, alpha=10),
+            cv2.COLORMAP_JET,
         )
         return cv2.addWeighted(frame, 0.7, heatmap_vis, 0.3, 0)
 
-    # ── fixation detection ────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Event detection
+    # ------------------------------------------------------------------
 
     def detect_fixation(self, gaze_point):
-        """I-VT (Velocity-Threshold) fixation detector.
-
-        Records a fixation when gaze stays within `fixation_threshold` pixels
-        for at least `min_fixation_duration` seconds.
-
-        Returns a dict if a new fixation was just completed, else None.
-        """
+        """Detect I-VT style fixation from smoothed gaze points."""
         if not self.enable_fixation or gaze_point is None:
             return None
 
         gx, gy = gaze_point
-
         if self.fixation_reference is None:
             self.fixation_reference = (gx, gy)
             self.fixation_start_time = time.time()
@@ -255,9 +238,8 @@ class EyeTracker:
 
         dx = abs(gx - self.fixation_reference[0])
         dy = abs(gy - self.fixation_reference[1])
-
         if dx <= self.fixation_threshold and dy <= self.fixation_threshold:
-            self._jitter_counter = 0  # reset jitter on stable frame
+            self._jitter_counter = 0
             duration = time.time() - self.fixation_start_time
             if duration >= self.min_fixation_duration:
                 fix = {
@@ -266,160 +248,151 @@ class EyeTracker:
                     "gaze_x": gx,
                     "gaze_y": gy,
                 }
-                # Reset for next fixation
                 self.fixation_start_time = time.time()
                 self.fixation_reference = (gx, gy)
-                self._jitter_counter = 0
                 return fix
         else:
-            # Allow a few jitter frames before truly resetting
             self._jitter_counter += 1
             if self._jitter_counter > self._jitter_tolerance:
                 self.fixation_start_time = time.time()
                 self.fixation_reference = (gx, gy)
                 self._jitter_counter = 0
-
         return None
 
-    # ── blink detection ───────────────────────────────────────────────
-
     def detect_blink(self, left_ok, right_ok):
-        """Return 1 if a blink was completed (N consecutive pupil-loss frames).
-
-        Uses hysteresis: pupil must be lost for `_blink_loss_threshold` frames
-        to count as one blink, preventing single-frame dropouts from inflating
-        the count.
-        """
+        """Return 1 only after sustained pupil loss, reducing false blinks."""
         if not self.enable_blink_detection:
             return 0
         if not left_ok or not right_ok:
             self._blink_loss_frames += 1
-            return 0  # still in potential blink — don't count yet
-        else:
-            if self._blink_loss_frames >= self._blink_loss_threshold:
-                self._blink_loss_frames = 0
-                self.blink_count += 1
-                return 1
-            self._blink_loss_frames = 0
             return 0
+        if self._blink_loss_frames >= self._blink_loss_threshold:
+            self._blink_loss_frames = 0
+            self.blink_count += 1
+            return 1
+        self._blink_loss_frames = 0
+        return 0
 
     def check_fatigue(self):
-        """Print a fatigue warning if blink rate exceeds threshold (after 10 s)."""
+        """Print a fatigue warning when blink rate is high after warmup."""
         elapsed = time.time() - self.start_time
         if elapsed > 10:
             blink_rate = self.blink_count / elapsed
             if blink_rate > 0.3 and not self.fatigue_alert_triggered:
-                print("⚠ 疲劳警告：眨眼频率偏高，请休息！")
+                print("Fatigue warning: blink rate is high; consider resting.")
                 self.fatigue_alert_triggered = True
 
-    # ── frame processing (orchestrator) ───────────────────────────────
+    # ------------------------------------------------------------------
+    # Frame processing and persistence
+    # ------------------------------------------------------------------
+
+    def _update_landmarks(self, rgb_frame):
+        if self.frame_count % self.process_every_n_frames != 0:
+            return self._last_landmarks, self._last_landmarks is not None
+
+        results = self.face_mesh.process(rgb_frame)
+        if results.multi_face_landmarks:
+            self._last_landmarks = results.multi_face_landmarks[0].landmark
+            self._stale_landmark_frames = 0
+            return self._last_landmarks, True
+
+        self._stale_landmark_frames += 1
+        if self._stale_landmark_frames > self.max_stale_landmark_frames:
+            self._last_landmarks = None
+        return self._last_landmarks, False
 
     def process_frame(self, frame):
-        """Run the full pipeline on one BGR frame.
-
-        Returns
-        -------
-        dict with keys:
-            timestamp, left_x, left_y, right_x, right_y,
-            gaze_x, gaze_y, blink, fixation (dict or None)
-        """
+        """Run the full pipeline on one BGR frame and append one CSV record."""
         if self.heatmap_layer is None and self.enable_heatmap:
             self.heatmap_layer = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.float32)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # --- MediaPipe: only run on key frames (frame-skip optimization) ---
-        if self.frame_count % self.process_every_n_frames == 0:
-            results = self.face_mesh.process(rgb)
-            if results.multi_face_landmarks:
-                self._last_landmarks = results.multi_face_landmarks[0].landmarks
-        landmarks = self._last_landmarks
-        results = None  # not used beyond this point
+        landmarks, fresh_face_detected = self._update_landmarks(rgb)
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        elapsed_sec = time.time() - self.start_time
         left_center = None
         right_center = None
         gaze_x = None
         gaze_y = None
-        blink = 0
         fixation = None
+        face_detected = landmarks is not None
 
         if landmarks is not None:
-
-            # Left eye
             roi_l, offset_l = self.extract_eye_roi(frame, landmarks, self.LEFT_EYE)
             left_center = self.detect_pupil(roi_l, draw_on=frame, offset=offset_l, label="Left Eye")
 
-            # Right eye
             roi_r, offset_r = self.extract_eye_roi(frame, landmarks, self.RIGHT_EYE)
             right_center = self.detect_pupil(roi_r, draw_on=frame, offset=offset_r, label="Right Eye")
 
-            # Gaze
             gaze_x, gaze_y = self.compute_gaze(left_center, right_center)
-
             if gaze_x is not None:
-                # Draw gaze crosshair
                 cv2.circle(frame, (gaze_x, gaze_y), 5, (0, 0, 255), -1)
                 cv2.line(frame, (gaze_x, 0), (gaze_x, frame.shape[0]), (0, 255, 0), 1)
                 cv2.line(frame, (0, gaze_y), (frame.shape[1], gaze_y), (0, 255, 0), 1)
-
-                # Heatmap
                 frame = self.update_heatmap((gaze_x, gaze_y), frame)
 
-                # Fixation
                 fixation = self.detect_fixation((gaze_x, gaze_y))
                 if fixation:
                     self.fixations.append(fixation)
 
-        # Blink
         blink = self.detect_blink(left_center is not None, right_center is not None)
+        confidence = self.estimate_gaze_confidence(face_detected, left_center, right_center)
+        fps = round(self.frame_count / elapsed_sec, 2) if elapsed_sec > 0 else None
 
-        # Record
         record = {
             "timestamp": timestamp,
+            "elapsed_sec": round(elapsed_sec, 3),
+            "frame": self.frame_count,
+            "face_detected": bool(face_detected),
+            "fresh_face_detected": bool(fresh_face_detected),
+            "pupil_detected_left": left_center is not None,
+            "pupil_detected_right": right_center is not None,
             "left_x": left_center[0] if left_center else None,
             "left_y": left_center[1] if left_center else None,
             "right_x": right_center[0] if right_center else None,
             "right_y": right_center[1] if right_center else None,
             "gaze_x": gaze_x,
             "gaze_y": gaze_y,
+            "gaze_confidence": confidence,
             "blink": blink,
+            "fps": fps,
         }
         self.data_records.append(record)
 
         self.check_fatigue()
         self.frame_count += 1
-
         return record
-
-    # ── main loop ─────────────────────────────────────────────────────
 
     def _open_capture(self):
         self.cap = cv2.VideoCapture(self.video_source)
         if not self.cap.isOpened():
-            print(f"无法打开视频源: {self.video_source}")
+            print(f"Unable to open video source: {self.video_source}")
             return False
         return True
 
-    def _flush_data(self, output_dir="results"):
-        """Incrementally save data to disk (crash-safe)."""
+    def _flush_data(self, output_dir=None):
+        """Incrementally save data to disk."""
+        output_dir = output_dir or self.output_dir
         if not self.data_records:
             return
         os.makedirs(output_dir, exist_ok=True)
         pd.DataFrame(self.data_records).to_csv(
-            os.path.join(output_dir, "eye_tracking_data_partial.csv"), index=False
+            os.path.join(output_dir, "eye_tracking_data_partial.csv"),
+            index=False,
         )
         if self.fixations:
             pd.DataFrame(self.fixations).to_csv(
-                os.path.join(output_dir, "fixations_partial.csv"), index=False
+                os.path.join(output_dir, "fixations_partial.csv"),
+                index=False,
             )
 
     def run(self):
-        """Start the main tracking loop. Press 'q' to quit."""
+        """Start the main tracking loop. Press Q to quit."""
         if not self._open_capture():
             return
 
-        print("眼动追踪已启动 — 按 Q 退出")
+        print("Eye tracking started. Press Q to quit.")
         try:
             while True:
                 ret, frame = self.cap.read()
@@ -427,56 +400,49 @@ class EyeTracker:
                     continue
 
                 self.process_frame(frame)
-
-                # Window
-                src_label = "摄像头" if self.video_source == 0 else str(self.video_source)
+                src_label = "webcam" if self.video_source == 0 else str(self.video_source)
                 cv2.imshow(f"Eye Tracking - {src_label}", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
-                # Periodic incremental save
                 if self.flush_interval > 0 and self.frame_count % self.flush_interval == 0:
                     self._flush_data()
 
                 if self.frame_count % 30 == 0:
-                    fps = self.frame_count / (time.time() - self.start_time)
-                    print(f"  FPS: {fps:.1f}")
+                    elapsed = max(time.time() - self.start_time, 1e-9)
+                    print(f"  FPS: {self.frame_count / elapsed:.1f}")
 
         except KeyboardInterrupt:
-            print("\n检测到中断信号，正在保存数据…")
-
+            print("\nInterrupted; saving data.")
         finally:
             self.cleanup()
 
     def cleanup(self):
-        """Release camera, destroy windows, save data."""
+        """Release camera, destroy windows, and save data."""
         if self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
         self.save_results()
 
-    # ── data export ───────────────────────────────────────────────────
-
-    def save_results(self, output_dir="results"):
+    def save_results(self, output_dir=None):
         """Export raw data CSV, fixations CSV, and gaze heatmap PNG."""
+        output_dir = output_dir or self.output_dir
         os.makedirs(output_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Raw data
         data_path = os.path.join(output_dir, f"eye_tracking_data_{ts}.csv")
         pd.DataFrame(self.data_records).to_csv(data_path, index=False)
 
-        # Fixations
         fix_path = os.path.join(output_dir, f"fixations_{ts}.csv")
         pd.DataFrame(self.fixations).to_csv(fix_path, index=False)
 
-        # Heatmap image
         if self.heatmap_layer is not None and np.max(self.heatmap_layer) > 0:
             heat_path = os.path.join(output_dir, f"gaze_heatmap_{ts}.png")
             plt.figure(figsize=(10, 6))
             heat_display = cv2.convertScaleAbs(
-                self.heatmap_layer, alpha=255.0 / np.max(self.heatmap_layer)
+                self.heatmap_layer,
+                alpha=255.0 / np.max(self.heatmap_layer),
             )
             plt.imshow(heat_display, cmap="jet")
             plt.title("Gaze Heatmap")
@@ -484,56 +450,78 @@ class EyeTracker:
             plt.savefig(heat_path)
             plt.close()
 
-        print(f"数据已保存 → {os.path.abspath(output_dir)}")
+        print(f"Data saved to {os.path.abspath(output_dir)}")
+        if self.open_output_dir:
+            self._open_folder(output_dir)
 
-        # Open folder
+    def _open_folder(self, output_dir):
+        abs_path = os.path.abspath(output_dir)
         if platform.system() == "Windows":
-            subprocess.Popen(f'explorer {os.path.abspath(output_dir)}')
+            subprocess.Popen(["explorer", abs_path])
         elif platform.system() == "Darwin":
-            subprocess.Popen(["open", os.path.abspath(output_dir)])
+            subprocess.Popen(["open", abs_path])
         elif platform.system() == "Linux":
-            subprocess.Popen(["xdg-open", os.path.abspath(output_dir)])
+            subprocess.Popen(["xdg-open", abs_path])
 
 
 class CalibratedEyeTracker(EyeTracker):
-    """EyeTracker with calibration → screen mapping + PyAutoGUI mouse control.
+    """EyeTracker with calibration, screen mapping, and dwell mouse control."""
 
-    Adds a 5-point calibration phase followed by gaze-to-screen mapping
-    using linear regression, real-time mouse movement, and auto-click on
-    sustained fixation (default 3 seconds).
-    """
-
-    def __init__(self, auto_click_duration=3.0, **kwargs):
+    def __init__(
+        self,
+        auto_click_duration=3.0,
+        calibration_points=5,
+        click_cooldown=1.0,
+        min_click_confidence=0.6,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.gaze_model = None
         self.auto_click_duration = auto_click_duration
+        self.calibration_points = calibration_points
+        self.click_cooldown = click_cooldown
+        self.min_click_confidence = min_click_confidence
         self.screen_w = None
         self.screen_h = None
-        # Independent auto-click state (separate from base fixation state)
         self._click_start_time = None
         self._click_reference = None
+        self._last_click_time = 0.0
+        self.calibration_report = []
 
-    # ── calibration ───────────────────────────────────────────────────
+    @staticmethod
+    def get_calibration_points(count):
+        """Return normalized calibration points for 5, 9, or 13 point modes."""
+        if count == 5:
+            return [(0.1, 0.1), (0.9, 0.1), (0.5, 0.5), (0.1, 0.9), (0.9, 0.9)]
+        if count == 9:
+            values = [0.1, 0.5, 0.9]
+            return [(x, y) for y in values for x in values]
+        if count == 13:
+            return [
+                (0.1, 0.1), (0.5, 0.1), (0.9, 0.1),
+                (0.25, 0.3), (0.75, 0.3),
+                (0.1, 0.5), (0.5, 0.5), (0.9, 0.5),
+                (0.25, 0.7), (0.75, 0.7),
+                (0.1, 0.9), (0.5, 0.9), (0.9, 0.9),
+            ]
+        raise ValueError("calibration_points must be one of: 5, 9, 13")
 
     def run_calibration(self):
-        """5-point calibration: user looks at each point, model is trained.
+        """Collect calibration samples and train gaze-to-screen mapping."""
+        import pyautogui
+        from sklearn.linear_model import LinearRegression
 
-        Returns True on success.
-        """
-        import pyautogui  # lazy import — only needed for calibration mode
-
-        print("校准阶段 — 请依次注视屏幕上的黄点")
+        calib_points = self.get_calibration_points(self.calibration_points)
+        print(f"Calibration started: {len(calib_points)} points.")
         calib_data = []
-        calib_points = [
-            (0.1, 0.1), (0.9, 0.1), (0.5, 0.5), (0.1, 0.9), (0.9, 0.9)
-        ]
-        idx = 0
+        started = time.time()
 
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            print("无法打开摄像头")
+            print("Unable to open webcam for calibration.")
             return False
 
+        idx = 0
         while idx < len(calib_points):
             ret, frame = cap.read()
             if not ret:
@@ -543,27 +531,31 @@ class CalibratedEyeTracker(EyeTracker):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = self.face_mesh.process(rgb)
 
+            norm_pt = calib_points[idx]
+            px, py = int(norm_pt[0] * w), int(norm_pt[1] * h)
+            cv2.circle(frame, (px, py), 15, (0, 255, 255), -1)
+            cv2.putText(
+                frame,
+                f"Point {idx + 1}/{len(calib_points)}",
+                (max(px - 60, 0), max(py - 25, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+
             if res.multi_face_landmarks:
                 lm = res.multi_face_landmarks[0].landmark
                 roi_l, off_l = self.extract_eye_roi(frame, lm, self.LEFT_EYE)
                 roi_r, off_r = self.extract_eye_roi(frame, lm, self.RIGHT_EYE)
-                pl = self.detect_pupil(roi_l)
-                pr = self.detect_pupil(roi_r)
+                pl = self.detect_pupil(roi_l, offset=off_l)
+                pr = self.detect_pupil(roi_r, offset=off_r)
 
                 if pl and pr:
-                    abs_l = (off_l[0] + pl[0], off_l[1] + pl[1])
-                    abs_r = (off_r[0] + pr[0], off_r[1] + pr[1])
-                    gx = (abs_l[0] + abs_r[0]) // 2
-                    gy = (abs_l[1] + abs_r[1]) // 2
-
-                    norm_pt = calib_points[idx]
-                    px, py = int(norm_pt[0] * w), int(norm_pt[1] * h)
-                    cv2.circle(frame, (px, py), 15, (0, 255, 255), -1)
-                    cv2.putText(frame, f"Point {idx+1}/5", (px - 40, py - 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                    calib_data.append([gx, gy, norm_pt[0], norm_pt[1]])
-                    print(f"  已采集点 {idx+1}/5 → 注视({gx},{gy})")
+                    gx = (pl[0] + pr[0]) // 2
+                    gy = (pl[1] + pr[1]) // 2
+                    calib_data.append([idx + 1, gx, gy, norm_pt[0], norm_pt[1]])
+                    print(f"  collected point {idx + 1}/{len(calib_points)} -> gaze=({gx},{gy})")
                     idx += 1
                     time.sleep(0.8)
 
@@ -574,30 +566,95 @@ class CalibratedEyeTracker(EyeTracker):
         cap.release()
         cv2.destroyAllWindows()
 
-        if len(calib_data) < 5:
-            print("校准数据不足")
+        if len(calib_data) < len(calib_points):
+            print("Insufficient calibration data.")
             return False
 
-        from sklearn.linear_model import LinearRegression
-        df = pd.DataFrame(calib_data, columns=["gx", "gy", "sx", "sy"])
+        df = pd.DataFrame(calib_data, columns=["point_index", "gx", "gy", "sx", "sy"])
         self.gaze_model = LinearRegression().fit(df[["gx", "gy"]], df[["sx", "sy"]])
         self.screen_w, self.screen_h = pyautogui.size()
-        print("校准完成 ✓")
+        self._save_calibration_report(df, time.time() - started)
+        print("Calibration complete.")
         return True
 
-    # ── screen mapping ────────────────────────────────────────────────
+    def _save_calibration_report(self, df, duration_sec):
+        predictions = self.gaze_model.predict(df[["gx", "gy"]])
+        report = df.copy()
+        report["pred_sx"] = predictions[:, 0]
+        report["pred_sy"] = predictions[:, 1]
+        report["error_px"] = np.sqrt(
+            ((report["pred_sx"] - report["sx"]) * self.screen_w) ** 2
+            + ((report["pred_sy"] - report["sy"]) * self.screen_h) ** 2
+        ).round(3)
+        report["calibration_mode"] = f"{self.calibration_points}-point"
+        report["calibration_duration_sec"] = round(duration_sec, 3)
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.output_dir, f"calibration_report_{ts}.csv")
+        report.to_csv(path, index=False)
+        self.calibration_report = report.to_dict("records")
+
+        print(
+            "Calibration error px: "
+            f"mean={report['error_px'].mean():.1f}, "
+            f"median={report['error_px'].median():.1f}, "
+            f"max={report['error_px'].max():.1f}"
+        )
 
     def map_to_screen(self, gaze_x, gaze_y):
-        """Map camera gaze coords → screen pixel coords via calibration model."""
-        if self.gaze_model is None:
+        """Map camera gaze coordinates to clamped screen pixel coordinates."""
+        if self.gaze_model is None or gaze_x is None or gaze_y is None:
             return None, None
-        sx, sy = self.gaze_model.predict([[gaze_x, gaze_y]])[0]
-        return int(sx * self.screen_w), int(sy * self.screen_h)
+        sx, sy = self.gaze_model.predict(pd.DataFrame([[gaze_x, gaze_y]], columns=["gx", "gy"]))[0]
+        screen_x = int(np.clip(sx * self.screen_w, 0, self.screen_w - 1))
+        screen_y = int(np.clip(sy * self.screen_h, 0, self.screen_h - 1))
+        return screen_x, screen_y
 
-    # ── tracking loop (override) ──────────────────────────────────────
+    def _reset_click_state(self, gaze_x=None, gaze_y=None):
+        self._click_start_time = time.time()
+        self._click_reference = (gaze_x, gaze_y) if gaze_x is not None and gaze_y is not None else None
+
+    def _update_dwell_click(self, frame, gaze_x, gaze_y, confidence, pyautogui_module):
+        if gaze_x is None or gaze_y is None or confidence < self.min_click_confidence:
+            self._reset_click_state()
+            return
+
+        if self._click_reference is None:
+            self._reset_click_state(gaze_x, gaze_y)
+            return
+
+        dx = abs(gaze_x - self._click_reference[0])
+        dy = abs(gaze_y - self._click_reference[1])
+        if dx > self.fixation_threshold or dy > self.fixation_threshold:
+            self._reset_click_state(gaze_x, gaze_y)
+            return
+
+        duration = time.time() - self._click_start_time
+        remaining = max(0.0, self.auto_click_duration - duration)
+        progress = 1.0 - remaining / self.auto_click_duration
+        radius = int(30 + 15 * progress)
+        color = (0, int(255 * progress), int(255 * (1 - progress)))
+        cv2.circle(frame, (gaze_x, gaze_y), radius, color, 2)
+        cv2.putText(
+            frame,
+            f"{remaining:.1f}s",
+            (gaze_x + 20, gaze_y - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+        )
+
+        now = time.time()
+        if duration >= self.auto_click_duration and now - self._last_click_time >= self.click_cooldown:
+            print("Dwell click.")
+            pyautogui_module.click()
+            self._last_click_time = now
+            self._reset_click_state(gaze_x, gaze_y)
 
     def run(self):
-        """Calibrate first, then track with mouse control. Press 'q' to quit."""
+        """Calibrate first, then track with mouse control. Press Q to quit."""
         if not self.run_calibration():
             return
 
@@ -606,63 +663,41 @@ class CalibratedEyeTracker(EyeTracker):
         if not self._open_capture():
             return
 
-        print("追踪已启动 — 鼠标将跟随你的视线，注视 3 秒自动点击 — 按 Q 退出")
-
+        print("Calibrated tracking started. Press Q to quit.")
         try:
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
                     continue
 
-                self.process_frame(frame)
+                record = self.process_frame(frame)
+                gaze_x = record["gaze_x"]
+                gaze_y = record["gaze_y"]
+                confidence = record["gaze_confidence"]
 
-                # Get the latest gaze from buffer
-                if self.gaze_buffer:
-                    gaze_x = int(sum(p[0] for p in self.gaze_buffer) / len(self.gaze_buffer))
-                    gaze_y = int(sum(p[1] for p in self.gaze_buffer) / len(self.gaze_buffer))
+                sx, sy = self.map_to_screen(gaze_x, gaze_y)
+                if sx is not None and confidence >= self.min_click_confidence:
+                    pyautogui.moveTo(sx, sy, duration=0.05)
+                    cv2.putText(
+                        frame,
+                        f"Screen: ({sx},{sy}) conf={confidence:.2f}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                    )
 
-                    sx, sy = self.map_to_screen(gaze_x, gaze_y)
-                    if sx is not None:
-                        pyautogui.moveTo(sx, sy, duration=0.05)
-                        cv2.putText(frame, f"Screen: ({sx},{sy})", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                # Auto-click countdown ring — uses independent state
-                if self._click_reference is None:
-                    self._click_start_time = time.time()
-                    self._click_reference = (gaze_x, gaze_y)
-                else:
-                    dx = abs(gaze_x - self._click_reference[0])
-                    dy = abs(gaze_y - self._click_reference[1])
-                    if dx <= self.fixation_threshold and dy <= self.fixation_threshold:
-                        duration = time.time() - self._click_start_time
-                        remaining = max(0, self.auto_click_duration - duration)
-                        progress = 1.0 - remaining / self.auto_click_duration
-                        radius = int(30 + 15 * progress)
-                        color = (0, int(255 * progress), int(255 * (1 - progress)))
-                        cv2.circle(frame, (gaze_x, gaze_y), radius, color, 2)
-                        cv2.putText(frame, f"{remaining:.1f}s",
-                                    (gaze_x + 20, gaze_y - 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                        if duration >= self.auto_click_duration:
-                            print("🖱 自动点击！")
-                            pyautogui.click()
-                            self._click_start_time = time.time()
-                            self._click_reference = (gaze_x, gaze_y)
-                    else:
-                        self._click_start_time = time.time()
-                        self._click_reference = (gaze_x, gaze_y)
+                self._update_dwell_click(frame, gaze_x, gaze_y, confidence, pyautogui)
 
                 cv2.imshow("Gaze Tracking (Calibrated)", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
-                # Periodic incremental save
                 if self.flush_interval > 0 and self.frame_count % self.flush_interval == 0:
                     self._flush_data()
 
         except KeyboardInterrupt:
-            print("\n中断信号…")
-
+            print("\nInterrupted; saving data.")
         finally:
             self.cleanup()

@@ -23,10 +23,13 @@
 | Source | Verified Facts |
 |---|---|
 | `README.md` | 项目是基于 OpenCV、MediaPipe、pandas、matplotlib 的普通摄像头眼动追踪项目，支持 gaze tracking、fixation、blink、heatmap、CSV 输出和校准版鼠标控制入口 |
-| `eye_project/eye_tracker.py` | 核心类为 `EyeTracker` 和 `CalibratedEyeTracker`，包含 MediaPipe Face Mesh、瞳孔阈值检测、gaze smoothing、I-VT fixation、blink 计数、heatmap、CSV/PNG 输出、5 点校准、线性回归映射和 dwell auto-click |
+| `eye_project/eye_tracker.py` | 核心类为 `EyeTracker` 和 `CalibratedEyeTracker`，包含 MediaPipe Face Mesh、瞳孔阈值检测、gaze smoothing、I-VT fixation、blink 计数、heatmap、CSV/PNG 输出、5/9/13 点校准、线性回归映射、gaze confidence、screen clamp 和 confidence-gated dwell auto-click |
 | `eye_project/eye_tracking.py` | 普通追踪入口，支持摄像头或视频文件输入 |
 | `eye_project/eye_tracking-test.py` | 校准和鼠标控制入口，默认 3 秒 dwell click |
-| `eye_project/requirements.txt` | 已声明 `opencv-python`、`mediapipe==0.10.0`、`pandas`、`matplotlib` |
+| `eye_project/requirements.txt` | 已声明 `opencv-python`、`mediapipe==0.10.35`、`pandas`、`matplotlib`、`scikit-learn`、`pyautogui` |
+| `eye_project/experiment_logger.py` | 已定义 trial-level CSV schema 和 append-only logger |
+| `eye_project/target_selection_experiment.py` | 已提供可控 mouse baseline target-selection 实验入口 |
+| `eye_project/analysis/analyze_results.py` | 已提供 trial log 摘要分析脚本 |
 | `plan_iui_2027.md`、`plan_chi_2027.md`、`plan_ieee_vr_2027.md` | 现有投稿路线建议，作为待确认的战略参考，不作为已验证会议要求 |
 
 未在仓库中找到 `paper/`、`docs/`、`manuscript/`、`experiments/`、`analysis/`、数据集说明、正式实验结果或论文源文件。因此，任何实验结果、样本量结论、会议截止日期、页数限制和模板要求都必须标记为待确认。
@@ -73,11 +76,11 @@
 | Main entry point | `eye_project/eye_tracking.py` |
 | Calibrated entry point | `eye_project/eye_tracking-test.py` |
 | Confirmed output | `results/eye_tracking_data_*.csv`, `results/fixations_*.csv`, `results/gaze_heatmap_*.png` when the program runs |
-| Confirmed calibration | 5-point calibration in `CalibratedEyeTracker.run_calibration()` |
-| Confirmed dwell behavior | Default 3-second auto-click after sustained fixation in calibrated mode |
+| Confirmed calibration | 5-point, 9-point, and 13-point calibration in `CalibratedEyeTracker.run_calibration()` |
+| Confirmed dwell behavior | Default 3-second auto-click after sustained fixation in calibrated mode, with confidence threshold and click cooldown |
 | Paper source | `NOT_STARTED`: no paper source file found |
 | Formal experiment dataset | `NOT_STARTED`: no formal dataset or participant data found |
-| Analysis scripts | `NOT_STARTED`: no analysis directory or result analysis script found |
+| Analysis scripts | `IN_PROGRESS`: `eye_project/analysis/analyze_results.py` summarizes trial logs |
 
 ### 2.2 Current Research Framing
 
@@ -150,9 +153,9 @@ We present and evaluate a low-cost webcam-based gaze interaction system for hand
 | Contribution | Current Status | Evidence Needed |
 |---|---|---|
 | A low-cost webcam-based gaze interaction prototype combining face landmark detection, pupil localization, smoothing, calibration, fixation, and dwell selection | `NEEDS_REVIEW` | Code review, system diagram, reproducible demo commands |
-| A target-selection experimental protocol for evaluating webcam gaze interaction | `NOT_STARTED` | Experiment UI, trial log schema, pilot data |
-| A comparison of mouse, 5-point gaze, and 9-point gaze selection | `NOT_STARTED` | Implement 9-point calibration, collect participant data |
-| A confidence-aware dwell-click mechanism to reduce false activation | `NOT_STARTED` | Confidence metric, dwell suppression logic, ablation |
+| A target-selection experimental protocol for evaluating webcam gaze interaction | `IN_PROGRESS` | Mouse baseline UI and trial log schema exist; gaze condition and pilot data still needed |
+| A comparison of mouse, 5-point gaze, and 9-point gaze selection | `IN_PROGRESS` | 9-point calibration exists; formal participant data still needed |
+| A confidence-aware dwell-click mechanism to reduce false activation | `IN_PROGRESS` | Confidence metric and dwell suppression exist; ablation still needed |
 | Practical usability limits and design implications | `NOT_STARTED` | Quantitative results, participant feedback, failure cases |
 
 ## 5. Claim-Evidence Matrix
@@ -163,16 +166,16 @@ No claim below is ready for the paper abstract or conclusion until its status be
 |---|---|---|---|---|
 | The system can track gaze using a commodity webcam and export gaze/fixation data | Existing implementation smoke test | `NEEDS_REVIEW` | `eye_project/eye_tracker.py`, runtime `results/` output | Needs real run log and example output |
 | The system supports hands-free pointing and dwell-based selection | Calibrated mode demo | `NEEDS_REVIEW` | `eye_project/eye_tracking-test.py` | Needs calibration validation and screen-bound handling |
-| 9-point calibration improves selection performance over 5-point calibration | Controlled target-selection study | `NOT_STARTED` | `TODO: experiments/target_selection/` | 9-point calibration not implemented |
-| Confidence-aware dwell reduces false clicks | Ablation: fixed dwell vs confidence-aware dwell | `NOT_STARTED` | `TODO: experiments/target_selection/` | Confidence metric not implemented |
-| Webcam gaze has practical usability limits under small targets or unstable tracking | Error and failure-case analysis | `NOT_STARTED` | `TODO: analysis/` | Requires participant data and honest negative results |
-| The project is reproducible by other researchers | Reproducibility checklist and clean environment run | `BLOCKED` | `README.md`, `requirements.txt` | Missing optional dependencies and exact environment lock |
+| 9-point calibration improves selection performance over 5-point calibration | Controlled target-selection study | `IN_PROGRESS` | `eye_project/eye_tracker.py`, `TODO: formal trial logs` | Calibration mode exists, but no participant comparison data yet |
+| Confidence-aware dwell reduces false clicks | Ablation: fixed dwell vs confidence-aware dwell | `IN_PROGRESS` | `eye_project/eye_tracker.py`, `TODO: ablation logs` | Confidence metric exists, but no ablation data yet |
+| Webcam gaze has practical usability limits under small targets or unstable tracking | Error and failure-case analysis | `NOT_STARTED` | `eye_project/analysis/analyze_results.py`, `TODO: formal trial logs` | Requires participant data and honest negative results |
+| The project is reproducible by other researchers | Reproducibility checklist and clean environment run | `NEEDS_REVIEW` | `README.md`, `requirements.txt`, `setup_env.ps1` | Needs clean-machine installation test |
 
 Blocked item details:
 
 | Item | Reason | Required Input | Next Step | Critical Path |
 |---|---|---|---|---|
-| Reproducibility claim | `requirements.txt` does not include `scikit-learn` or `pyautogui`, although calibrated mode imports them | Dependency decision and environment test | Update dependency documentation or requirements, then run clean install | Yes |
+| Clean environment verification | Dependencies are declared, but a fresh environment install has not been run in this task | Clean install result | Run `.\setup_env.ps1` or equivalent in a fresh environment | Yes |
 
 ## 6. Experiment Plan
 
@@ -182,11 +185,11 @@ Blocked item details:
 |---|---|---|---|---|---|---|
 | E0 | System smoke test | Verify webcam/video input, gaze CSV, fixation CSV, and heatmap output | `P0` | `NOT_STARTED` | Camera or sample video | Example `results/` folder and run notes |
 | E1 | Calibration validation | Measure 5-point calibration error and verify coordinate mapping | `P0` | `NOT_STARTED` | Stable calibrated run | Calibration report CSV |
-| E2 | Target-selection UI | Provide controlled target selection instead of raw desktop mouse control | `P0` | `NOT_STARTED` | Experiment UI | Trial-level CSV |
-| E3 | Mouse baseline | Establish upper-bound baseline for target selection | `P0` | `NOT_STARTED` | E2 | Baseline results table |
-| E4 | 5-point vs 9-point gaze | Compare calibration density | `P1` | `NOT_STARTED` | 9-point calibration | Accuracy/time/error plots |
+| E2 | Target-selection UI | Provide controlled target selection instead of raw desktop mouse control | `P0` | `IN_PROGRESS` | Experiment UI | Mouse baseline trial-level CSV is implemented; gaze mode remains planned |
+| E3 | Mouse baseline | Establish upper-bound baseline for target selection | `P0` | `IN_PROGRESS` | E2 | Mouse baseline runner exists; pilot data still needed |
+| E4 | 5-point vs 9-point gaze | Compare calibration density | `P1` | `IN_PROGRESS` | 9-point calibration | 9-point calibration exists; formal comparison still needed |
 | E5 | Smoothing ablation | Compare with and without gaze smoothing | `P1` | `NOT_STARTED` | Configurable smoothing | Stability and selection plots |
-| E6 | Fixed dwell vs confidence-aware dwell | Test false activation reduction | `P1` | `NOT_STARTED` | Confidence metric | False-click and cancellation table |
+| E6 | Fixed dwell vs confidence-aware dwell | Test false activation reduction | `P1` | `IN_PROGRESS` | Confidence metric | Code support exists; ablation data still needed |
 | E7 | Robustness / failure cases | Characterize lighting, glasses, face loss, pupil loss, head movement | `P2` | `NOT_STARTED` | Logging fields | Failure-case table |
 | E8 | Realistic tasks | Test web navigation, media control, or communication-board tasks | `P2` | `NOT_STARTED` | Stable toolkit/demo | Task success and qualitative notes |
 | E9 | 3D UI selection | Prepare IEEE VR route | `P3` | `DEFERRED` | 3D UI implementation | 2D/3D comparison |
@@ -248,13 +251,13 @@ An experiment is not `DONE` just because code ran. It must satisfy:
 
 | Check | Current Status | Required Action | Priority |
 |---|---|---|---|
-| Environment can be recreated | `IN_PROGRESS` | Confirm Python version, test `pip install -r eye_project/requirements.txt` | `P0` |
-| Dependencies are complete | `BLOCKED` | Decide whether `scikit-learn` and `pyautogui` belong in requirements or optional extras | `P0` |
-| Minimal run command exists | `NEEDS_REVIEW` | Keep README commands and add experiment-specific commands once available | `P0` |
+| Environment can be recreated | `NEEDS_REVIEW` | Confirm Python version, test `pip install -r eye_project/requirements.txt` in a clean venv | `P0` |
+| Dependencies are complete | `DONE` | `scikit-learn` and `pyautogui` are now declared in requirements | `P0` |
+| Minimal run command exists | `DONE` | README documents tracking, calibrated mode, mouse baseline, and analysis commands | `P0` |
 | Data acquisition method is clear | `NOT_STARTED` | Define webcam/video inputs, participant consent, storage policy | `P0` |
-| Logs are traceable | `NOT_STARTED` | Add trial-level logger before formal study | `P0` |
-| Results are generated by scripts | `NOT_STARTED` | Add `analysis/` scripts for summary tables and figures | `P1` |
-| Random seeds are recorded | `NOT_STARTED` | Add seed field for target order and condition order | `P1` |
+| Logs are traceable | `IN_PROGRESS` | Trial-level logger exists; gaze experiment integration remains | `P0` |
+| Results are generated by scripts | `IN_PROGRESS` | Summary script exists; figure generation remains | `P1` |
+| Random seeds are recorded | `IN_PROGRESS` | Mouse baseline experiment accepts `--seed`; gaze condition still needs the same field | `P1` |
 | Local paths are avoided | `NEEDS_REVIEW` | Keep output relative to project or configurable output directory | `P1` |
 | Secrets and private data are excluded | `NEEDS_REVIEW` | Keep `.env`, `results/`, CSV and PNG outputs ignored unless anonymized examples are intentionally added | `P0` |
 | Double-blind repository is possible | `NOT_STARTED` | Prepare anonymous copy after conference route is selected | `P1` |
@@ -373,12 +376,12 @@ target venue confirmation
 | Priority | Task | Owner | Status | Definition of Done |
 |---|---|---|---|---|
 | `P0` | Decide primary submission route and paper type | TODO | `NOT_STARTED` | Target table has official CFP facts |
-| `P0` | Run a clean environment smoke test | TODO | `NOT_STARTED` | Commands and outputs recorded |
-| `P0` | Resolve calibrated-mode dependencies | TODO | `BLOCKED` | `scikit-learn` and `pyautogui` dependency policy is explicit |
-| `P0` | Add trial-level experiment logger | TODO | `NOT_STARTED` | CSV contains required schema |
-| `P0` | Build target-selection experiment UI | TODO | `NOT_STARTED` | Mouse and gaze trials produce comparable logs |
-| `P1` | Add 9-point calibration mode or defer claim | TODO | `NOT_STARTED` | 5/9-point comparison can be run, or claim is removed |
-| `P1` | Add analysis scripts | TODO | `NOT_STARTED` | Summary tables and plots regenerate from raw logs |
+| `P0` | Run a clean environment smoke test | TODO | `NEEDS_REVIEW` | Commands and outputs recorded |
+| `P0` | Resolve calibrated-mode dependencies | TODO | `DONE` | `scikit-learn` and `pyautogui` are in `requirements.txt` |
+| `P0` | Add trial-level experiment logger | TODO | `DONE` | CSV contains required schema |
+| `P0` | Build target-selection experiment UI | TODO | `IN_PROGRESS` | Mouse baseline works; gaze trial integration remains |
+| `P1` | Add 9-point calibration mode or defer claim | TODO | `DONE` | 5/9/13-point calibration modes are available |
+| `P1` | Add analysis scripts | TODO | `IN_PROGRESS` | Trial summary script exists; figure generation remains |
 | `P1` | Draft system/method section | TODO | `NOT_STARTED` | Text matches actual implementation |
 | `P2` | Add subjective questionnaire and interview notes | TODO | `NOT_STARTED` | SUS/NASA-TLX/fatigue fields are defined |
 | `P3` | Explore 3D UI demo for IEEE VR route | TODO | `DEFERRED` | Demo scope is decided after IUI/CHI route |
@@ -388,3 +391,4 @@ target venue confirmation
 | Date | Change | Author |
 |---|---|---|
 | 2026-07-12 | Reworked the document from conference-route advice into a general executable submission plan with project snapshot, status system, claim-evidence matrix, experiment backlog, reproducibility plan, review workflow, submission checklist, risk register, timeline, and post-submission workflow. Corrected the unverified calibration offset bug claim. | Codex |
+| 2026-07-12 | Implemented core engineering optimizations: completed calibrated-mode dependencies, added confidence fields, 5/9/13-point calibration, calibration reports, click cooldown, screen clamping, trial logger, mouse target-selection baseline, analysis summary script, and updated README/setup commands. | Codex |

@@ -1,104 +1,131 @@
 # Eye Tracking Project
 
-基于 OpenCV + MediaPipe 的瞳孔追踪与注视点分析系统。
+Low-cost webcam-based gaze tracking and gaze interaction prototype built with
+OpenCV, MediaPipe, pandas, matplotlib, scikit-learn, and PyAutoGUI. The current
+dependency set is validated against Python 3.12.
 
-## 功能
+## Features
 
-- **瞳孔检测**：使用 MediaPipe Face Mesh 定位眼部区域，自适应阈值检测瞳孔中心
-- **注视点追踪**：实时计算双眼瞳孔中心 → 画面注视坐标，叠加十字线 + 热力图（带衰减防饱和）
-- **注视分析 (Fixation)**：I-VT 算法 + 3 帧抖动容错，准确记录注视起止时间和位置
-- **眨眼检测**：滞后滤波（连续 3 帧瞳孔丢失才算一次眨眼），疲劳告警
-- **数据导出**：自动保存 CSV 数据、注视记录和热力图 PNG；支持增量存盘防崩溃
-- **校准 + 鼠标控制** (`eye_tracking-test.py`)：5 点校准 → 线性回归模型 → PyAutoGUI 屏幕映射 + 注视 3 秒自动点击
-- **性能优化**：可配置帧跳过（MediaPipe 隔帧运行）、调试窗口可选关闭
+- Pupil detection with MediaPipe Face Mesh eye landmarks and OpenCV adaptive thresholding.
+- Real-time gaze point estimation from both pupil centers with configurable smoothing.
+- I-VT style fixation detection with jitter tolerance.
+- Blink-like pupil-loss counting and fatigue warning.
+- Traceable CSV outputs for gaze, pupil, face-detection, confidence, blink, FPS, and fixation data.
+- Gaze heatmap export.
+- 5-point, 9-point, and 13-point calibration modes for screen mapping.
+- Confidence-gated dwell click with click cooldown and clamped screen coordinates.
+- Mouse baseline target-selection experiment with trial-level logging.
+- Basic analysis script for trial-level experiment summaries.
 
-## 项目结构
+## Project Structure
 
-```
+```text
 eye_project/
-├── eye_tracker.py           # 核心引擎（EyeTracker + CalibratedEyeTracker 类）
-├── eye_tracking.py          # 主入口（视频文件 / 摄像头）
-├── eye_tracking-test.py     # 校准版入口（PyAutoGUI 鼠标控制）
-├── requirements.txt         # Python 依赖
-├── setup_env.ps1            # PowerShell 一键环境配置脚本
-├── eye_tracking_data.csv    # 输出：追踪数据
-├── fixations.csv            # 输出：注视分析数据
-└── gaze_heatmap*.png        # 输出：注视热力图
+├── eye_tracker.py                 # Core tracker and calibrated gaze-control classes
+├── eye_tracking.py                # Webcam/video tracking entry point
+├── eye_tracking-test.py           # Calibrated gaze mouse-control entry point
+├── experiment_logger.py           # Stable trial-level CSV schema and logger
+├── target_selection_experiment.py # Mouse baseline target-selection experiment
+├── analysis/
+│   └── analyze_results.py         # Summary script for trial logs
+├── requirements.txt               # Python dependencies
+└── setup_env.ps1                  # PowerShell environment setup
 ```
 
-## 快速开始
+Runtime outputs are written to `results/`, which is ignored by Git.
 
-### 1. 创建虚拟环境
+## Setup
 
 ```powershell
 cd eye_project
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-```
-
-> 若遇到权限错误，先运行：`Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`
-
-或直接运行一键脚本：
-
-```powershell
-.\setup_env.ps1
-```
-
-### 2. 安装依赖
-
-```bash
 pip install -r requirements.txt
 ```
 
-`eye_tracking-test.py` 额外需要：
+Or run:
 
-```bash
-pip install scikit-learn pyautogui
+```powershell
+cd eye_project
+.\setup_env.ps1
 ```
 
-### 3. 运行
+If PowerShell blocks script execution, run:
 
-**主程序**（有 UI 文件选择对话框，支持视频文件或摄像头）：
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
 
-```bash
+## Run Gaze Tracking
+
+Use the file picker, or cancel to use the webcam:
+
+```powershell
 python eye_tracking.py
 ```
 
-**校准 + 鼠标控制版**（注视 3 秒自动点击）：
+Use webcam directly:
 
-```bash
-python eye_tracking-test.py
+```powershell
+python eye_tracking.py --source 0
 ```
 
-按 `Q` 键退出，数据自动保存到 `results/`。
+Use a video file:
 
-### 4. 高级用法
-
-```python
-from eye_tracker import EyeTracker
-
-# 每 2 帧跑一次 MediaPipe（提升性能）
-tracker = EyeTracker(video_source=0, process_every_n_frames=2)
-
-# 开启调试窗口
-tracker = EyeTracker(show_debug_windows=True)
-
-# 每 150 帧增量存盘（防崩溃丢数据）
-tracker = EyeTracker(flush_interval=150)
-
-tracker.run()
+```powershell
+python eye_tracking.py --source path\to\video.mp4
 ```
 
-## 依赖
+Useful options:
 
-| 包 | 用途 |
-|---|---|
-| opencv-python | 视频处理、图像处理、可视化 |
-| mediapipe | 人脸网格 → 眼部关键点 |
-| pandas | 数据记录与导出 |
-| matplotlib | 热力图渲染 |
-| scikit-learn (可选) | 校准阶段线性回归 |
-| pyautogui (可选) | 屏幕鼠标映射 |
+```powershell
+python eye_tracking.py --source 0 --process-every-n-frames 2 --flush-interval 150
+```
+
+Press `Q` to quit. The tracker writes gaze CSV, fixation CSV, and heatmap PNG files to `results/`.
+
+## Run Calibrated Gaze Mouse Control
+
+```powershell
+python eye_tracking-test.py --calibration-points 9 --auto-click-duration 3.0
+```
+
+Supported calibration modes:
+
+- `--calibration-points 5`
+- `--calibration-points 9`
+- `--calibration-points 13`
+
+The calibrated mode writes a `calibration_report_*.csv` file with per-point
+training residuals. Dwell clicks are suppressed when gaze confidence is below
+`--min-click-confidence`, and repeated clicks are limited by `--click-cooldown`.
+
+## Run Mouse Baseline Experiment
+
+This provides a controlled target-selection surface before gaze conditions are
+integrated.
+
+```powershell
+python target_selection_experiment.py --participant-id pilot01 --trials-per-radius 8
+```
+
+It logs trial-level CSV files with target size, click location, success, false
+click count, timeout/miss, and selection time.
+
+## Analyze Trial Logs
+
+```powershell
+python analysis\analyze_results.py --input "results/trial_log_*.csv" --output results\summary_trials.csv
+```
+
+The script reports success rate, selection time, false clicks, miss rate, and
+distance-to-target summaries grouped by condition, input method, and target size.
+
+## Research Notes
+
+For conference submission planning, see `conference_submission_plan.md`.
+Do not report experiment results in a paper unless they are traceable to raw
+CSV logs and reproducible analysis scripts.
 
 ## License
 
