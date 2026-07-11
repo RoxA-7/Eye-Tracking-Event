@@ -1,32 +1,53 @@
-"""
-Eye Tracking — main entry point.
+"""Main entry point for webcam/video gaze tracking."""
 
-Select a video file or use the webcam, then track gaze in real time.
-Press Q to quit; data is auto-saved to results/ on exit.
-"""
-
+import argparse
 import tkinter as tk
 from tkinter import filedialog
+
 from eye_tracker import EyeTracker
 
 
 def select_video_source():
-    """Open a file dialog for video selection; return 0 for webcam if cancelled."""
+    """Open a file dialog for video selection; return webcam if cancelled."""
     root = tk.Tk()
     root.withdraw()
     path = filedialog.askopenfilename(
-        title="选择视频文件（取消则使用摄像头）",
+        title="Select a video file (cancel to use webcam)",
         filetypes=[("Video Files", "*.mp4 *.avi *.mov"), ("All Files", "*.*")],
     )
     return path if path else 0
 
 
-if __name__ == "__main__":
-    source = select_video_source()
-    if source == 0:
-        print("使用摄像头作为输入源")
-    else:
-        print(f"使用视频文件：{source}")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run webcam/video eye tracking.")
+    parser.add_argument("--source", default=None, help="Video path or webcam index. Omit for file dialog.")
+    parser.add_argument("--output-dir", default="results")
+    parser.add_argument("--process-every-n-frames", type=int, default=1)
+    parser.add_argument("--flush-interval", type=int, default=300)
+    parser.add_argument("--show-debug-windows", action="store_true")
+    parser.add_argument("--open-output-dir", action="store_true")
+    return parser.parse_args()
 
-    tracker = EyeTracker(video_source=source)
+
+def parse_source(source):
+    if source is None:
+        return select_video_source()
+    if str(source).isdigit():
+        return int(source)
+    return source
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    source = parse_source(args.source)
+    print(f"Using video source: {source}")
+
+    tracker = EyeTracker(
+        video_source=source,
+        output_dir=args.output_dir,
+        process_every_n_frames=args.process_every_n_frames,
+        flush_interval=args.flush_interval,
+        show_debug_windows=args.show_debug_windows,
+        open_output_dir=args.open_output_dir,
+    )
     tracker.run()
